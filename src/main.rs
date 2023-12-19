@@ -8,8 +8,8 @@ use petgraph::graph::{NodeIndex, UnGraph};
 use changelog_v1::thread_pool::ThreadPool;
 
 lazy_static! {
-    static ref GRAPH: Mutex<UnGraph<Box<RealFile>, PrEdge>> = Mutex::new(UnGraph::new_undirected());
-    static ref FILE_TO_NODE: Mutex<HashMap<String, NodeIndex>> = Mutex::new(HashMap::new());
+    static ref GRAPH: Mutex<UnGraph<String, PrEdge>> = Mutex::new(UnGraph::new_undirected());
+    static ref FILE_TO_NODE: Mutex<HashMap<String, FileInfo>> = Mutex::new(HashMap::new());
 }
 static GITHUB: OnceCell<Octocrab> = OnceCell::const_new();
 async fn get_github() -> &'static Octocrab {
@@ -42,7 +42,6 @@ async fn main() -> octocrab::Result<()> {
     let reading_username = "XAMPPRocky";
     let reading_repo = "octocrab";
 
-    // TODO: Make optional (if repo is private)
     let pr_handler = get_github().await.pulls(reading_username, reading_repo);
 
     let page = pr_handler.list()
@@ -80,35 +79,40 @@ async fn add_nodes(pr: PullRequest, pr_handler: &PullRequestHandler<'_>) {
     let mut graph = GRAPH.lock().unwrap();
     let mut file_to_node = FILE_TO_NODE.lock().unwrap();
 
-    // TODO: change value to struct with past names/paths, and node index.
-    let mut file_nodes = HashMap::new();
+    // Get or create nodes for files edited within this PR
     for edited_file in &pr_files.items {
         let filename = &edited_file.filename;
-        let node_index = match file_to_node.get(filename) {
-            Some(&index) => index,
-            None => {
-                // File node doesn't exist, create a new node
-                let real_file = RealFile::new(filename.clone());
-                let new_index = graph.add_node(real_file);
-                file_to_node.insert(filename.clone(), new_index);
-                new_index
+        let previous_filename = edited_file.previous_filename.as_ref();
+
+        // Check if the file is known under a different (previous) name
+        let _node_index = if let Some(prev_name) = previous_filename {
+            if let Some(file_info) = file_to_node.get_mut(prev_name) {
+                file_info.update_name(filename.clone());
+                println!("File name changed from {:?} to {:?}", filename.clone(), prev_name);
+                file_info.node_index
+            } else {
+                create_new_file_node(filename, &mut graph, &mut file_to_node)
+            }
+        } else {
+            match file_to_node.get(filename) {
+                Some(file_info) => file_info.node_index,
+                None => create_new_file_node(filename, &mut graph, &mut file_to_node),
             }
         };
-        file_nodes.insert(filename, node_index);
     }
 
     // Create and count shared edges
     let n_files_changed = pr_files.items.len();
     for (i, f) in pr_files.clone().into_iter().enumerate() {
 
-        let fi = file_nodes.get(&f.filename).unwrap();
+        let fi = file_to_node.get(&f.filename).unwrap();
 
         for j in (i + 1)..n_files_changed {
             let g = pr_files.items.get(j).expect("No file at j");
 
-            let gi = file_nodes.get(&g.filename).unwrap();
+            let gi = file_to_node.get(&g.filename).unwrap();
 
-            let edge = graph.find_edge(*fi, *gi);
+            let edge = graph.find_edge(fi.node_index, gi.node_index);
             match edge {
                 Some(e) => {
                     let edge_data = graph.edge_weight_mut(e).unwrap();
@@ -117,12 +121,19 @@ async fn add_nodes(pr: PullRequest, pr_handler: &PullRequestHandler<'_>) {
                 }
                 None => {
                     let new_edge = PrEdge::new(pr.number);
-                    graph.add_edge(*fi, *gi, new_edge);
-                    println!("Adding node between {:?} - {:?}", g.filename, f.filename);
+                    graph.add_edge(fi.node_index, gi.node_index, new_edge);
+                    // println!("Adding node between {:?} - {:?}", g.filename, f.filename);
                 }
             }
         }
     }
+}
+
+fn create_new_file_node(filename: &str, graph: &mut UnGraph<String, PrEdge>, file_to_node: &mut HashMap<String, FileInfo>) -> NodeIndex {
+    let real_file = filename.to_string();
+    let new_index = graph.add_node(real_file);
+    file_to_node.insert(filename.to_string(), FileInfo::new(filename.to_string(), new_index));
+    new_index
 }
 
 fn print_graph_edges() {
@@ -137,8 +148,8 @@ fn print_graph_edges() {
 
         println!(
             "Edge from {:?} to {:?} in PRs: {:?}",
-            source_info.filename,
-            target_info.filename,
+            source_info,
+            target_info,
             edge_data.pr_numbers
         );
     }
@@ -178,14 +189,25 @@ fn handle_connection(mut stream: TcpStream) {
 
 
 #[derive(Default)]
-struct RealFile {
-    filename: String
-    // TODO: Past names
-    // paths: Vec<String>
+struct FileInfo {
+    current_name: String,
+    previous_names: Vec<String>,
+    node_index: NodeIndex,
 }
-impl RealFile {
-    pub fn new(filename: String) -> Box<RealFile> {
-        Box::new(RealFile { filename })
+impl FileInfo {
+    fn new(name: String, node_index: NodeIndex) -> Self {
+        FileInfo {
+            current_name: name,
+            previous_names: Vec::new(),
+            node_index,
+        }
+    }
+
+    fn update_name(&mut self, new_name: String) {
+        if new_name != self.current_name {
+            self.previous_names.push(self.current_name.clone());
+            self.current_name = new_name;
+        }
     }
 }
 
