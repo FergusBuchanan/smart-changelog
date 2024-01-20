@@ -14,3 +14,6 @@ Execute:
 ```
 cargo run
 ```
+
+## Example
+[![Demo video](https://youtu.be/8T6hdO6UyBY)](https://youtu.be/8T6hdO6UyBY)
