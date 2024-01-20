@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use octocrab::models;
 use tokio::sync::OnceCell;
 use lazy_static::lazy_static;
-use octocrab::{Octocrab, params, models::pulls::PullRequest, pulls::PullRequestHandler};
+use octocrab::{Octocrab, params};
 use petgraph::graph::{NodeIndex, UnGraph};
 
 use changelog_v1::thread_pool::ThreadPool;
 
 lazy_static! {
-    static ref GRAPH: Mutex<UnGraph<String, PrEdge>> = Mutex::new(UnGraph::new_undirected());
+    static ref GRAPH: Mutex<UnGraph<String, ChangeEdge>> = Mutex::new(UnGraph::new_undirected());
     static ref FILE_TO_NODE: Mutex<HashMap<String, FileInfo>> = Mutex::new(HashMap::new());
 }
 static GITHUB: OnceCell<Octocrab> = OnceCell::const_new();
@@ -35,101 +36,101 @@ async fn get_github() -> &'static Octocrab {
  */
 #[tokio::main]
 async fn main() -> octocrab::Result<()> {
-    // TODO: Get username and repo
-    // let args: Vec<String> = env::args().collect();
-    // dbg!(args);
+    let octocrab = get_github().await;
 
-    let reading_username = "XAMPPRocky";
-    let reading_repo = "octocrab";
+    let owner = "XAMPPRocky"; // Replace with the repository owner's name
+    let repo = "octocrab"; // Replace with the repository name
 
-    let pr_handler = get_github().await.pulls(reading_username, reading_repo);
-
-    let page = pr_handler.list()
+    // Fetch all pull requests
+    let prs = octocrab.pulls(owner, repo)
+        .list()
         .state(params::State::Closed)
-        .head("main")
-        // .per_page(4)
-        // .page(1u32)
-        // Send the request
+        .per_page(2)
         .send()
-        .await?;
+        .await?
+        .items;
 
-    for pr in page.into_iter() {
-        add_nodes(pr, &pr_handler).await;
-    }
+
+        for pr in prs {
+            println!("PR #{}: {:?}", pr.number, pr.title);
     
-    print_graph_edges();
+            // Fetch the commits associated with the pull request
+            let pr_commits_url = format!("https://api.github.com/repos/{}/{}/pulls/{}/commits", owner, repo, pr.number);
+            let commits: Vec<models::commits::Commit> = octocrab.get(pr_commits_url, None::<&()>).await?;
+    
+            for commit in commits {
+                println!("\tCommit: {}", commit.sha);
+    
+                // Construct the URL for the specific commit
+                let commit_url = format!("https://api.github.com/repos/{}/{}/commits/{}", owner, repo, commit.sha);
+    
+                // Fetch the specific commit details
+                let commit_detail: models::commits::Commit = octocrab.get(commit_url, None::<&()>).await?;
+                if let Some(pr_files) = commit_detail.files.clone() {
+                    let mut graph = GRAPH.lock().unwrap();
+                    let mut file_to_node = FILE_TO_NODE.lock().unwrap();
 
-    // create_server();
+                    for file in &pr_files {
+                        println!("\t\tFile: {:#?}", file.filename);
+
+                        // Check if the file is known under a different (previous) name
+                        let _node_index = if let Some(prev_name) = &file.previous_filename {
+                            if let Some(file_info) = file_to_node.get_mut(prev_name) {
+                                file_info.update_name(file.filename.clone());
+                                println!("File name changed from {:?} to {:?}", file.filename.clone(), prev_name);
+                                file_info.node_index
+                            } else {
+                                create_new_file_node(&file.filename, &mut graph, &mut file_to_node)
+                            }
+                        } else {
+                            match file_to_node.get(&file.filename) {
+                                Some(file_info) => file_info.node_index,
+                                None => create_new_file_node(&file.filename, &mut graph, &mut file_to_node),
+                            }
+                        };
+                    }
+
+                    let n_files_changed = pr_files.len();
+                    for (i, file) in pr_files.clone().into_iter().enumerate() {
+
+                        // Create and count shared edges
+                        let this_edited = file_to_node.get(&file.filename).unwrap();
+                        for j in (i + 1)..n_files_changed {
+                            let other_edited_commit = pr_files.get(j).expect("No file at j");
+
+                            let other_edited = file_to_node.get(&other_edited_commit.filename).unwrap();
+
+                            let edge = graph.find_edge(this_edited.node_index, other_edited.node_index);
+                            match edge {
+                                Some(e) => {
+                                    let existing_edge = graph.edge_weight_mut(e).unwrap();
+                                    if !existing_edge.pr_numbers.contains(&pr.number) {
+                                        existing_edge.add_pr(pr.number);
+                                    }
+                                    existing_edge.add_commit(commit.commit.message.to_string());
+                                    println!("Adding weight between {:?} - {:?}", other_edited_commit.filename, file.filename);
+                                }
+                                None => {
+                                    let new_edge = ChangeEdge::new(pr.number, commit.commit.message.to_string());
+                                    graph.add_edge(this_edited.node_index, other_edited.node_index, new_edge);
+                                    println!("Adding node between {:?} - {:?}", other_edited_commit.filename, file.filename);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        print_graph_edges();
+        print_graph_commit_edges();
 
     Ok(())
 }
 
-async fn add_nodes(pr: PullRequest, pr_handler: &PullRequestHandler<'_>) {
-    let pr_files = match pr_handler.list_files(pr.number).await {
-        Ok(files) => files,
-        Err(_) => {
-            eprintln!("Failed to list files for PR #{}", pr.number);
-            return;
-        }
-    };
 
-    let title = pr.title.clone().unwrap_or_default();
-    println!("Adding nodes for #{}: {}", pr.number, title);
 
-    let mut graph = GRAPH.lock().unwrap();
-    let mut file_to_node = FILE_TO_NODE.lock().unwrap();
-
-    // Get or create nodes for files edited within this PR
-    for edited_file in &pr_files.items {
-        let filename = &edited_file.filename;
-        let previous_filename = edited_file.previous_filename.as_ref();
-
-        // Check if the file is known under a different (previous) name
-        let _node_index = if let Some(prev_name) = previous_filename {
-            if let Some(file_info) = file_to_node.get_mut(prev_name) {
-                file_info.update_name(filename.clone());
-                println!("File name changed from {:?} to {:?}", filename.clone(), prev_name);
-                file_info.node_index
-            } else {
-                create_new_file_node(filename, &mut graph, &mut file_to_node)
-            }
-        } else {
-            match file_to_node.get(filename) {
-                Some(file_info) => file_info.node_index,
-                None => create_new_file_node(filename, &mut graph, &mut file_to_node),
-            }
-        };
-    }
-
-    // Create and count shared edges
-    let n_files_changed = pr_files.items.len();
-    for (i, f) in pr_files.clone().into_iter().enumerate() {
-
-        let fi = file_to_node.get(&f.filename).unwrap();
-
-        for j in (i + 1)..n_files_changed {
-            let g = pr_files.items.get(j).expect("No file at j");
-
-            let gi = file_to_node.get(&g.filename).unwrap();
-
-            let edge = graph.find_edge(fi.node_index, gi.node_index);
-            match edge {
-                Some(e) => {
-                    let edge_data = graph.edge_weight_mut(e).unwrap();
-                    edge_data.add_pr(pr.number);
-                    println!("Adding weight between {:?} - {:?}", g.filename, f.filename);
-                }
-                None => {
-                    let new_edge = PrEdge::new(pr.number);
-                    graph.add_edge(fi.node_index, gi.node_index, new_edge);
-                    // println!("Adding node between {:?} - {:?}", g.filename, f.filename);
-                }
-            }
-        }
-    }
-}
-
-fn create_new_file_node(filename: &str, graph: &mut UnGraph<String, PrEdge>, file_to_node: &mut HashMap<String, FileInfo>) -> NodeIndex {
+fn create_new_file_node(filename: &str, graph: &mut UnGraph<String, ChangeEdge>, file_to_node: &mut HashMap<String, FileInfo>) -> NodeIndex {
     let real_file = filename.to_string();
     let new_index = graph.add_node(real_file);
     file_to_node.insert(filename.to_string(), FileInfo::new(filename.to_string(), new_index));
@@ -151,6 +152,24 @@ fn print_graph_edges() {
             source_info,
             target_info,
             edge_data.pr_numbers
+        );
+    }
+}
+fn print_graph_commit_edges() {
+    let graph = GRAPH.lock().unwrap();
+
+    for edge in graph.edge_indices() {
+        let (source_node, target_node) = graph.edge_endpoints(edge).unwrap();
+        let edge_data = &graph[edge];
+
+        let source_info = &graph[source_node];
+        let target_info = &graph[target_node];
+
+        println!(
+            "Edge from {:?} to {:?} in Commits: {:?}",
+            source_info,
+            target_info,
+            edge_data.commit_numbers
         );
     }
 }
@@ -211,16 +230,23 @@ impl FileInfo {
     }
 }
 
-pub struct PrEdge {
+pub struct ChangeEdge {
     pr_numbers: Vec<u64>,
+    commit_numbers: Vec<String>,
 }
-impl PrEdge {
-    fn new(pr_number: u64) -> Self {
-        PrEdge {
+impl ChangeEdge {
+    fn new(pr_number: u64, commit_numbers: String) -> Self {
+        ChangeEdge {
             pr_numbers: vec![pr_number],
+            commit_numbers: vec![commit_numbers],
         }
     }
 
+    fn add_commit(&mut self, commit_number: String) {
+        if !self.commit_numbers.contains(&commit_number) {
+            self.commit_numbers.push(commit_number);
+        }
+    }
     fn add_pr(&mut self, pr_number: u64) {
         if !self.pr_numbers.contains(&pr_number) {
             self.pr_numbers.push(pr_number);
