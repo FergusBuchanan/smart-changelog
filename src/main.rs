@@ -9,6 +9,7 @@ use serde::{Serialize, Deserialize};
 use std::fs::{File, read_to_string};
 use std::io::prelude::*;
 use std::net::{TcpStream, TcpListener};
+use tokio::time::Instant;
 
 use changelog_v1::thread_pool::ThreadPool;
 
@@ -45,7 +46,6 @@ async fn main() -> octocrab::Result<()> {
     let owner = "XAMPPRocky"; // Replace with the repository owner's name
     let repo = "octocrab"; // Replace with the repository name
 
-    // Fetch all pull requests
     let prs = octocrab.pulls(owner, repo)
         .list()
         .state(params::State::Closed)
@@ -53,79 +53,18 @@ async fn main() -> octocrab::Result<()> {
         .send()
         .await?
         .items;
+    let n_prs = &prs.len();
 
+    let start = Instant::now();
     for pr in prs {
-        println!("PR #{}: {:?}", pr.number, pr.title);
-
-        // Fetch the commits associated with the pull request
-        let pr_commits_url = format!("https://api.github.com/repos/{}/{}/pulls/{}/commits", owner, repo, pr.number);
-        let commits: Vec<models::commits::Commit> = octocrab.get(pr_commits_url, None::<&()>).await?;
-
-        for commit in commits {
-            println!("\tCommit: {}", commit.sha);
-
-            // Construct the URL for the specific commit
-            let commit_url = format!("https://api.github.com/repos/{}/{}/commits/{}", owner, repo, commit.sha);
-
-            // Fetch the specific commit details
-            let commit_detail: models::commits::Commit = octocrab.get(commit_url, None::<&()>).await?;
-            if let Some(pr_files) = commit_detail.files.clone() {
-                let mut graph = GRAPH.lock().unwrap();
-                let mut file_to_node = FILE_TO_NODE.lock().unwrap();
-
-                for file in &pr_files {
-                    println!("\t\tFile: {:#?}", file.filename);
-
-                    // Check if the file is known under a different (previous) name
-                    let _node_index = if let Some(prev_name) = &file.previous_filename {
-                        if let Some(file_info) = file_to_node.get_mut(prev_name) {
-                            file_info.update_name(file.filename.clone());
-                            println!("File name changed from {:?} to {:?}", file.filename.clone(), prev_name);
-                            file_info.node_index
-                        } else {
-                            create_new_file_node(&file.filename, &mut graph, &mut file_to_node)
-                        }
-                    } else {
-                        match file_to_node.get(&file.filename) {
-                            Some(file_info) => file_info.node_index,
-                            None => create_new_file_node(&file.filename, &mut graph, &mut file_to_node),
-                        }
-                    };
-                }
-
-                let n_files_changed = pr_files.len();
-                for (i, file) in pr_files.clone().into_iter().enumerate() {
-                    // Create and count shared edges
-                    let this_edited = file_to_node.get(&file.filename).unwrap();
-                    for j in (i + 1)..n_files_changed {
-                        if i == j { continue } // safety: do not connect to self
-
-                        let other_edited_commit = pr_files.get(j).expect("No file at j");
-                        let other_edited = file_to_node.get(&other_edited_commit.filename).unwrap();
-                        let edge = graph.find_edge(this_edited.node_index, other_edited.node_index);
-                        match edge {
-                            Some(e) => {
-                                let existing_edge = graph.edge_weight_mut(e).unwrap();
-                                if !existing_edge.pr_numbers.contains(&pr.number) {
-                                    existing_edge.add_pr(pr.number);
-                                }
-                                existing_edge.add_commit(commit.commit.message.to_string());
-                                println!("Adding weight between {:?} - {:?}", other_edited_commit.filename, file.filename);
-                            }
-                            None => {
-                                let new_edge = ChangeEdge::new(pr.number, commit.commit.message.to_string());
-                                graph.add_edge(this_edited.node_index, other_edited.node_index, new_edge);
-                                println!("Adding node between {:?} - {:?}", other_edited_commit.filename, file.filename);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        process_pr(pr, &octocrab, &owner, &repo).await;
     }
+    let duration = start.elapsed();
 
     print_graph_edges();
     print_graph_commit_edges();
+
+    println!("Time elapsed processing {:?} pr's is: {:?}", n_prs, duration);
 
     let graph = GRAPH.lock().unwrap();
     let serialized_graph = serialize_graph(&graph);
@@ -139,8 +78,73 @@ async fn main() -> octocrab::Result<()> {
     Ok(())
 }
 
+async fn process_pr(pr: models::pulls::PullRequest, octocrab: &Octocrab, owner: &str, repo: &str) {
+    println!("PR #{}: {:?}", pr.number, pr.title);
 
+    // Fetch the commits associated with the pull request
+    let pr_commits_url = format!("https://api.github.com/repos/{}/{}/pulls/{}/commits", owner, repo, pr.number);
+    let commits: Vec<models::commits::Commit> = octocrab.get(pr_commits_url, None::<&()>).await.expect("no commits?");
 
+    for commit in commits {
+        println!("\tCommit: {}", commit.sha);
+        let commit_url = format!("https://api.github.com/repos/{}/{}/commits/{}", owner, repo, commit.sha);
+
+        // Fetch the specific commit details
+        let commit_detail: models::commits::Commit = octocrab.get(commit_url, None::<&()>).await.expect("no commit details?");
+        if let Some(pr_files) = commit_detail.files.clone() {
+            let mut graph = GRAPH.lock().unwrap();
+            let mut file_to_node = FILE_TO_NODE.lock().unwrap();
+
+            for file in &pr_files {
+                println!("\t\tFile: {:#?}", file.filename);
+
+                // Check if the file is known under a different (previous) name
+                let _node_index = if let Some(prev_name) = &file.previous_filename {
+                    if let Some(file_info) = file_to_node.get_mut(prev_name) {
+                        file_info.update_name(file.filename.clone());
+                        println!("File name changed from {:?} to {:?}", file.filename.clone(), prev_name);
+                        file_info.node_index
+                    } else {
+                        create_new_file_node(&file.filename, &mut graph, &mut file_to_node)
+                    }
+                } else {
+                    match file_to_node.get(&file.filename) {
+                        Some(file_info) => file_info.node_index,
+                        None => create_new_file_node(&file.filename, &mut graph, &mut file_to_node),
+                    }
+                };
+            }
+
+            let n_files_changed = pr_files.len();
+            for (i, file) in pr_files.clone().into_iter().enumerate() {
+                // Create and count shared edges
+                let this_edited = file_to_node.get(&file.filename).unwrap();
+                for j in (i + 1)..n_files_changed {
+                    if i == j { continue } // safety: do not connect to self
+
+                    let other_edited_commit = pr_files.get(j).expect("No file at j");
+                    let other_edited = file_to_node.get(&other_edited_commit.filename).unwrap();
+                    let edge = graph.find_edge(this_edited.node_index, other_edited.node_index);
+                    match edge {
+                        Some(e) => {
+                            let existing_edge = graph.edge_weight_mut(e).unwrap();
+                            if !existing_edge.pr_numbers.contains(&pr.number) {
+                                existing_edge.add_pr(pr.number);
+                            }
+                            existing_edge.add_commit(commit.commit.message.to_string());
+                            println!("Adding weight between {:?} - {:?}", other_edited_commit.filename, file.filename);
+                        }
+                        None => {
+                            let new_edge = ChangeEdge::new(pr.number, commit.commit.message.to_string());
+                            graph.add_edge(this_edited.node_index, other_edited.node_index, new_edge);
+                            println!("Adding node between {:?} - {:?}", other_edited_commit.filename, file.filename);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 fn create_new_file_node(filename: &str, graph: &mut UnGraph<String, ChangeEdge>, file_to_node: &mut HashMap<String, FileInfo>) -> NodeIndex {
     let real_file = filename.to_string();
     let new_index = graph.add_node(real_file);
@@ -202,7 +206,6 @@ fn handle_connection(mut stream: TcpStream) {
     let mut buffer = [0; 1024];
     stream.read(&mut buffer).unwrap();
 
-    // Parse the request
     let request_line = String::from_utf8_lossy(&buffer);
     let request_line = request_line.lines().next().unwrap();
     let requested_file = request_line.split_whitespace().nth(1).unwrap();
@@ -282,7 +285,6 @@ impl ChangeEdge {
     }
 }
 
-
 /***
  * TODO:
  *  - Multithreading reading of PR's versus singlethreaded
@@ -292,19 +294,17 @@ impl ChangeEdge {
  *  - Key could be file path as we see when it has been changed (look at oldname), maybe value should be struct, keep names of old file paths.
  */
 
-
-
 #[derive(Serialize, Deserialize)]
 struct SerializableNode {
-    id: usize, // Use NodeIndex's index
-    data: String, // Assuming node data is String
+    id: usize,
+    data: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct SerializableEdge {
-    source: usize, // Source node index
-    target: usize, // Target node index
-    data: ChangeEdge, // Your edge data, must be serializable
+    source: usize,
+    target: usize,
+    data: ChangeEdge,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -325,7 +325,7 @@ fn serialize_graph(graph: &UnGraph<String, ChangeEdge>) -> SerializableGraph {
         .map(|edge| SerializableEdge {
             source: edge.source().index(),
             target: edge.target().index(),
-            data: edge.weight().clone(), // Ensure ChangeEdge is Clone + Serialize
+            data: edge.weight().clone(),
         })
         .collect();
 
