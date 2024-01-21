@@ -49,7 +49,7 @@ async fn main() -> octocrab::Result<()> {
     let prs = octocrab.pulls(owner, repo)
         .list()
         .state(params::State::Closed)
-        .per_page(50)
+        .per_page(100)
         .send()
         .await?
         .items;
@@ -61,8 +61,8 @@ async fn main() -> octocrab::Result<()> {
     }
     let duration = start.elapsed();
 
-    print_graph_edges();
-    print_graph_commit_edges();
+    // print_graph_edges();
+    // print_graph_commit_edges();
 
     println!("Time elapsed processing {:?} pr's is: {:?}", n_prs, duration);
 
